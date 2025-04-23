@@ -7,6 +7,7 @@ import time
 import zlib
 from collections import defaultdict
 from queue import Queue, Full, Empty
+import mediapipe as mp
 
 # UDP配置
 UDP_IP = "0.0.0.0"  # 监听所有网络接口
@@ -62,6 +63,74 @@ class Statistics:
         self.reset_frame_stats(frame_id, total_packets)
         self.frame_stats[frame_id]['received_packets'].add(packet_id)
         self.total_packets = sum(fs['total_packets'] for fs in self.frame_stats.values())
+
+class FaceDetector:
+    def __init__(self):
+        # 初始化MediaPipe人脸检测
+        self.mp_face_detection = mp.solutions.face_detection
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            model_selection=1,  # 0表示适合近距离人脸，1表示适合远距离人脸
+            min_detection_confidence=0.5
+        )
+        # 初始化MediaPipe人脸网格
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=3,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+    def detect_faces(self, frame):
+        """检测人脸"""
+        # 将BGR图像转换为RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # 进行人脸检测
+        detection_results = self.face_detection.process(rgb_frame)
+        
+        # 进行人脸网格检测
+        mesh_results = self.face_mesh.process(rgb_frame)
+        
+        if detection_results.detections:
+            for detection in detection_results.detections:
+                # 获取边界框
+                bbox = detection.location_data.relative_bounding_box
+                ih, iw, _ = frame.shape
+                x, y = int(bbox.xmin * iw), int(bbox.ymin * ih)
+                w, h = int(bbox.width * iw), int(bbox.height * ih)
+                
+                # 绘制边界框
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                # 显示置信度分数
+                score = detection.score[0]
+                cv2.putText(frame, f'Score: {score:.2f}', (x, y - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # 绘制人脸网格
+        if mesh_results.multi_face_landmarks:
+            for face_landmarks in mesh_results.multi_face_landmarks:
+                # 绘制所有特征点
+                for idx, landmark in enumerate(face_landmarks.landmark):
+                    ih, iw, _ = frame.shape
+                    x, y = int(landmark.x * iw), int(landmark.y * ih)
+                    cv2.circle(frame, (x, y), 1, (255, 0, 0), -1)
+                
+                # 绘制眼睛轮廓
+                left_eye = [(face_landmarks.landmark[p].x * iw, face_landmarks.landmark[p].y * ih) 
+                           for p in [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7]]
+                right_eye = [(face_landmarks.landmark[p].x * iw, face_landmarks.landmark[p].y * ih) 
+                            for p in [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382]]
+                
+                # 转换为numpy数组并绘制
+                left_eye = np.array(left_eye, dtype=np.int32)
+                right_eye = np.array(right_eye, dtype=np.int32)
+                cv2.polylines(frame, [left_eye], True, (0, 255, 255), 1)
+                cv2.polylines(frame, [right_eye], True, (0, 255, 255), 1)
+        
+        return frame
 
 class FrameAssembler:
     def __init__(self):
@@ -163,6 +232,9 @@ def receive_stream(assembler):
             print(f"接收数据错误: {e}")
 
 def display_stream(assembler):
+    # 初始化人脸检测器
+    face_detector = FaceDetector()
+    
     # 确保在主线程中创建窗口
     try:
         cv2.namedWindow('Camera Stream', cv2.WINDOW_NORMAL)
@@ -182,7 +254,10 @@ def display_stream(assembler):
             frame_interval = current_time - last_frame_time
             last_frame_time = current_time
             
-            # 添加更多统计信息到画面
+            # 进行人脸检测
+            frame = face_detector.detect_faces(frame)
+            
+            # 添加统计信息到画面
             cv2.putText(frame, f'FPS: {fps:.1f}', (10, 30),
                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.putText(frame, f'Frame Interval: {frame_interval*1000:.1f}ms', (10, 70),
