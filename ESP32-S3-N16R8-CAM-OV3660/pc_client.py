@@ -7,7 +7,7 @@ import time
 import zlib
 from collections import defaultdict
 from queue import Queue, Full, Empty
-import mediapipe as mp
+from ultralytics import YOLO
 
 # UDP配置
 UDP_IP = "0.0.0.0"  # 监听所有网络接口
@@ -64,71 +64,55 @@ class Statistics:
         self.frame_stats[frame_id]['received_packets'].add(packet_id)
         self.total_packets = sum(fs['total_packets'] for fs in self.frame_stats.values())
 
-class FaceDetector:
+class ObjectDetector:
     def __init__(self):
-        # 初始化MediaPipe人脸检测
-        self.mp_face_detection = mp.solutions.face_detection
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.face_detection = self.mp_face_detection.FaceDetection(
-            model_selection=1,  # 0表示适合近距离人脸，1表示适合远距离人脸
-            min_detection_confidence=0.5
-        )
-        # 初始化MediaPipe人脸网格
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=3,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
+        # 使用更大的YOLOv8模型来提高准确率
+        self.model = YOLO('yolov8x.pt')  # 从nano版本升级到x版本
+        # 设置较高的置信度阈值来减少误识别
+        self.conf_threshold = 0.5
         
-    def detect_faces(self, frame):
-        """检测人脸"""
-        # 将BGR图像转换为RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def detect_objects(self, frame):
+        """检测物体"""
+        # 图像预处理：提高分辨率和对比度
+        frame = cv2.resize(frame, None, fx=1.2, fy=1.2, interpolation=cv2.INTER_LINEAR)
         
-        # 进行人脸检测
-        detection_results = self.face_detection.process(rgb_frame)
+        # 增强对比度
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        enhanced = cv2.merge((cl,a,b))
+        frame = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
         
-        # 进行人脸网格检测
-        mesh_results = self.face_mesh.process(rgb_frame)
+        # 进行物体检测，设置较高的置信度阈值
+        results = self.model(frame, conf=self.conf_threshold)
         
-        if detection_results.detections:
-            for detection in detection_results.detections:
-                # 获取边界框
-                bbox = detection.location_data.relative_bounding_box
-                ih, iw, _ = frame.shape
-                x, y = int(bbox.xmin * iw), int(bbox.ymin * ih)
-                w, h = int(bbox.width * iw), int(bbox.height * ih)
+        # 在图像上绘制检测结果
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                # 获取边界框坐标
+                x1, y1, x2, y2 = box.xyxy[0]
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                
+                # 获取置信度和类别
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                name = result.names[cls]
+                
+                # 使用更醒目的颜色和更粗的线条
+                color = (0, 255, 0) if conf > 0.7 else (0, 165, 255)
+                thickness = 3 if conf > 0.7 else 2
                 
                 # 绘制边界框
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
                 
-                # 显示置信度分数
-                score = detection.score[0]
-                cv2.putText(frame, f'Score: {score:.2f}', (x, y - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # 绘制人脸网格
-        if mesh_results.multi_face_landmarks:
-            for face_landmarks in mesh_results.multi_face_landmarks:
-                # 绘制所有特征点
-                for idx, landmark in enumerate(face_landmarks.landmark):
-                    ih, iw, _ = frame.shape
-                    x, y = int(landmark.x * iw), int(landmark.y * ih)
-                    cv2.circle(frame, (x, y), 1, (255, 0, 0), -1)
-                
-                # 绘制眼睛轮廓
-                left_eye = [(face_landmarks.landmark[p].x * iw, face_landmarks.landmark[p].y * ih) 
-                           for p in [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7]]
-                right_eye = [(face_landmarks.landmark[p].x * iw, face_landmarks.landmark[p].y * ih) 
-                            for p in [362, 398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382]]
-                
-                # 转换为numpy数组并绘制
-                left_eye = np.array(left_eye, dtype=np.int32)
-                right_eye = np.array(right_eye, dtype=np.int32)
-                cv2.polylines(frame, [left_eye], True, (0, 255, 255), 1)
-                cv2.polylines(frame, [right_eye], True, (0, 255, 255), 1)
+                # 添加背景以提高标签可读性
+                label = f'{name} {conf:.2f}'
+                (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1 - 30), (x1 + label_width, y1), color, -1)
+                cv2.putText(frame, label, (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return frame
 
@@ -232,8 +216,8 @@ def receive_stream(assembler):
             print(f"接收数据错误: {e}")
 
 def display_stream(assembler):
-    # 初始化人脸检测器
-    face_detector = FaceDetector()
+    # 初始化物体检测器
+    object_detector = ObjectDetector()
     
     # 确保在主线程中创建窗口
     try:
@@ -254,8 +238,8 @@ def display_stream(assembler):
             frame_interval = current_time - last_frame_time
             last_frame_time = current_time
             
-            # 进行人脸检测
-            frame = face_detector.detect_faces(frame)
+            # 进行物体检测
+            frame = object_detector.detect_objects(frame)
             
             # 添加统计信息到画面
             cv2.putText(frame, f'FPS: {fps:.1f}', (10, 30),
