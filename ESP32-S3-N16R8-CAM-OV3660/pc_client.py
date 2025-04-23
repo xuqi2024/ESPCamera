@@ -5,6 +5,9 @@ import threading
 import struct
 import time
 import zlib
+import pyttsx3
+import asyncio
+from translate import Translator
 from collections import defaultdict
 from queue import Queue, Full, Empty
 from ultralytics import YOLO
@@ -64,12 +67,59 @@ class Statistics:
         self.frame_stats[frame_id]['received_packets'].add(packet_id)
         self.total_packets = sum(fs['total_packets'] for fs in self.frame_stats.values())
 
+class TTSManager:
+    def __init__(self):
+        self.engine = pyttsx3.init()
+        # 设置中文语音
+        voices = self.engine.getProperty('voices')
+        for voice in voices:
+            if 'chinese' in voice.name.lower():
+                self.engine.setProperty('voice', voice.id)
+                break
+        self.engine.setProperty('rate', 200)  # 语速
+        self.translator = Translator(to_lang="zh")
+        self.last_spoken = {}  # 用于记录上次播报时间
+        self.speak_interval = 3  # 同一物体的最小播报间隔（秒）
+        self.engine.startLoop(False)  # 非阻塞模式
+
+    def translate_to_chinese(self, text):
+        try:
+            return self.translator.translate(text)
+        except Exception as e:
+            print(f"翻译错误: {e}")
+            return text
+
+    def speak(self, text, object_id):
+        current_time = time.time()
+        # 检查是否需要播报
+        if object_id in self.last_spoken:
+            if current_time - self.last_spoken[object_id] < self.speak_interval:
+                return
+        
+        # 更新播报时间
+        self.last_spoken[object_id] = current_time
+        
+        try:
+            # 翻译并播报
+            chinese_text = self.translate_to_chinese(text)
+            self.engine.say(chinese_text)
+            self.engine.iterate()
+        except Exception as e:
+            print(f"TTS错误: {e}")
+
+    def __del__(self):
+        try:
+            self.engine.endLoop()
+        except:
+            pass
+
 class ObjectDetector:
     def __init__(self):
         # 使用更大的YOLOv8模型来提高准确率
         self.model = YOLO('yolov8x.pt')  # 从nano版本升级到x版本
         # 设置较高的置信度阈值来减少误识别
         self.conf_threshold = 0.5
+        self.tts_manager = TTSManager()
         
     def detect_objects(self, frame):
         """检测物体"""
@@ -113,6 +163,12 @@ class ObjectDetector:
                 cv2.rectangle(frame, (x1, y1 - 30), (x1 + label_width, y1), color, -1)
                 cv2.putText(frame, label, (x1, y1 - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # 如果置信度高于0.7，进行语音播报
+                if conf > 0.7:
+                    # 使用对象的位置和类别作为唯一标识
+                    object_id = f"{name}_{int(x1)}_{int(y1)}"
+                    self.tts_manager.speak(name, object_id)
         
         return frame
 
