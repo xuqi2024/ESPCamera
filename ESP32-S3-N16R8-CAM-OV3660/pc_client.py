@@ -6,7 +6,7 @@ import struct
 import time
 import zlib
 import pyttsx3
-import asyncio
+import argparse
 from translate import Translator
 from collections import defaultdict
 from queue import Queue, Full, Empty
@@ -26,12 +26,14 @@ class Statistics:
         self.current_frame_id = 0
         self.received_packets = set()
         self.last_feedback_time = time.time()
-        self.feedback_interval = 0.1  # 提高反馈频率到100ms
+        self.feedback_interval = 0.2  # 降低反馈频率到200ms
         self.fps = 0
         self.frame_count = 0
         self.last_fps_time = time.time()
         self.frame_stats = {}
-        self.processing_time = 0  # 添加处理时间统计
+        self.processing_time = 0
+        self.window_size = 15  # 减小统计窗口大小
+        self.frame_history = []
 
     def update_fps(self):
         self.frame_count += 1
@@ -41,9 +43,19 @@ class Statistics:
             self.fps = self.frame_count / time_diff
             self.frame_count = 0
             self.last_fps_time = current_time
+            
+            # 计算滑动窗口内的丢包率
+            total_lost = 0
+            total_packets = 0
+            for frame in self.frame_history[-self.window_size:]:
+                total_lost += frame['lost']
+                total_packets += frame['total']
+            
+            loss_rate = (total_lost / max(1, total_packets)) * 100 if total_packets > 0 else 0
+            
             # 打印详细统计信息
             print(f"性能统计 - FPS: {self.fps:.1f}, "
-                  f"丢包率: {(self.lost_packets / max(1, self.total_packets)) * 100:.2f}%, "
+                  f"丢包率: {loss_rate:.2f}%, "
                   f"平均处理时间: {self.processing_time*1000:.2f}ms")
 
     def reset_frame_stats(self, frame_id, total_packets):
@@ -54,12 +66,25 @@ class Statistics:
                 'complete': False,
                 'start_time': time.time()
             }
-        # 只保留最近10帧的统计
-        old_frames = [fid for fid in self.frame_stats.keys() if fid < frame_id - 10]
+            
+        # 检查前一帧是否完成
+        if frame_id > 0 and (frame_id - 1) in self.frame_stats:
+            prev_frame = self.frame_stats[frame_id - 1]
+            if not prev_frame['complete']:
+                lost_packets = prev_frame['total_packets'] - len(prev_frame['received_packets'])
+                self.frame_history.append({
+                    'total': prev_frame['total_packets'],
+                    'lost': lost_packets
+                })
+                prev_frame['complete'] = True
+        
+        # 保持历史记录在窗口大小范围内
+        if len(self.frame_history) > self.window_size:
+            self.frame_history.pop(0)
+            
+        # 清理旧的帧统计信息
+        old_frames = [fid for fid in self.frame_stats.keys() if fid < frame_id - self.window_size]
         for fid in old_frames:
-            if not self.frame_stats[fid]['complete']:
-                self.lost_packets += (self.frame_stats[fid]['total_packets'] - 
-                                    len(self.frame_stats[fid]['received_packets']))
             del self.frame_stats[fid]
 
     def add_packet(self, frame_id, packet_id, total_packets):
@@ -115,14 +140,15 @@ class TTSManager:
 
 class ObjectDetector:
     def __init__(self):
-        # 使用更大的YOLOv8模型来提高准确率
-        self.model = YOLO('yolov8x.pt')  # 从nano版本升级到x版本
-        # 设置较高的置信度阈值来减少误识别
+        # 使用YOLOv8模型
+        self.model = YOLO('yolov8x.pt')
         self.conf_threshold = 0.5
         self.tts_manager = TTSManager()
+        # 定义红绿灯的类别ID（在COCO数据集中，交通灯的类别ID为9）
+        self.traffic_light_class = 9
         
     def detect_objects(self, frame):
-        """检测物体"""
+        """只检测红绿灯"""
         # 图像预处理：提高分辨率和对比度
         frame = cv2.resize(frame, None, fx=1.2, fy=1.2, interpolation=cv2.INTER_LINEAR)
         
@@ -134,41 +160,73 @@ class ObjectDetector:
         enhanced = cv2.merge((cl,a,b))
         frame = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
         
-        # 进行物体检测，设置较高的置信度阈值
+        # 进行物体检测
         results = self.model(frame, conf=self.conf_threshold)
         
-        # 在图像上绘制检测结果
         for result in results:
             boxes = result.boxes
             for box in boxes:
+                # 只处理交通灯
+                cls = int(box.cls[0])
+                if cls != self.traffic_light_class:
+                    continue
+                
                 # 获取边界框坐标
                 x1, y1, x2, y2 = box.xyxy[0]
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 
-                # 获取置信度和类别
+                # 获取置信度
                 conf = float(box.conf[0])
-                cls = int(box.cls[0])
-                name = result.names[cls]
                 
-                # 使用更醒目的颜色和更粗的线条
-                color = (0, 255, 0) if conf > 0.7 else (0, 165, 255)
-                thickness = 3 if conf > 0.7 else 2
+                # 提取红绿灯区域并判断颜色
+                light_roi = frame[y1:y2, x1:x2]
+                if light_roi.size == 0:
+                    continue
                 
-                # 绘制边界框
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                # 转换到HSV颜色空间
+                hsv_roi = cv2.cvtColor(light_roi, cv2.COLOR_BGR2HSV)
                 
-                # 添加背景以提高标签可读性
-                label = f'{name} {conf:.2f}'
-                (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x1, y1 - 30), (x1 + label_width, y1), color, -1)
-                cv2.putText(frame, label, (x1, y1 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                # 定义红色和绿色的HSV范围
+                red_lower1 = np.array([0, 100, 100])
+                red_upper1 = np.array([10, 255, 255])
+                red_lower2 = np.array([160, 100, 100])
+                red_upper2 = np.array([180, 255, 255])
+                green_lower = np.array([35, 100, 100])
+                green_upper = np.array([85, 255, 255])
                 
-                # 如果置信度高于0.7，进行语音播报
-                if conf > 0.7:
-                    # 使用对象的位置和类别作为唯一标识
-                    object_id = f"{name}_{int(x1)}_{int(y1)}"
-                    self.tts_manager.speak(name, object_id)
+                # 创建红色和绿色的掩码
+                red_mask1 = cv2.inRange(hsv_roi, red_lower1, red_upper1)
+                red_mask2 = cv2.inRange(hsv_roi, red_lower2, red_upper2)
+                red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+                green_mask = cv2.inRange(hsv_roi, green_lower, green_upper)
+                
+                # 计算红色和绿色像素的数量
+                red_pixels = cv2.countNonZero(red_mask)
+                green_pixels = cv2.countNonZero(green_mask)
+                
+                # 根据像素数量判断红绿灯状态
+                color = None
+                if red_pixels > green_pixels and red_pixels > 50:
+                    color = "红灯"
+                    box_color = (0, 0, 255)  # 红色边框
+                elif green_pixels > red_pixels and green_pixels > 50:
+                    color = "绿灯"
+                    box_color = (0, 255, 0)  # 绿色边框
+                
+                if color and conf > 0.7:
+                    # 绘制边界框
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 3)
+                    
+                    # 添加标签
+                    label = f'{color} {conf:.2f}'
+                    (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(frame, (x1, y1 - 30), (x1 + label_width, y1), box_color, -1)
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    
+                    # 语音播报
+                    object_id = f"traffic_light_{x1}_{y1}"
+                    self.tts_manager.speak(color, object_id)
         
         return frame
 
@@ -271,20 +329,23 @@ def receive_stream(assembler):
         except Exception as e:
             print(f"接收数据错误: {e}")
 
-def display_stream(assembler):
+def display_stream(assembler, headless=False):
     # 初始化物体检测器
     object_detector = ObjectDetector()
     
-    # 确保在主线程中创建窗口
-    try:
-        cv2.namedWindow('Camera Stream', cv2.WINDOW_NORMAL)
-        cv2.moveWindow('Camera Stream', 0, 0)  # 移动窗口到左上角
-        cv2.resizeWindow('Camera Stream', 1024, 768)  # 使用更大的窗口
-    except Exception as e:
-        print(f"创建窗口失败: {e}")
-        return
+    if not headless:
+        try:
+            cv2.namedWindow('Camera Stream', cv2.WINDOW_NORMAL)
+            cv2.moveWindow('Camera Stream', 0, 0)
+            cv2.resizeWindow('Camera Stream', 800, 600)  # 降低显示分辨率
+        except Exception as e:
+            print(f"创建窗口失败: {e}")
+            return
     
     last_frame_time = time.time()
+    min_frame_interval = 0.1  # 限制最大FPS为10
+    skip_frames = 2  # 每3帧处理1帧
+    frame_counter = 0
     
     while True:
         try:
@@ -292,45 +353,87 @@ def display_stream(assembler):
             
             current_time = time.time()
             frame_interval = current_time - last_frame_time
+            
+            # 控制帧率
+            if frame_interval < min_frame_interval:
+                continue
+                
+            frame_counter += 1
+            if frame_counter % skip_frames != 0:
+                continue
+                
             last_frame_time = current_time
             
+            # 降低处理分辨率
+            if frame.shape[0] > 480:  # 如果高度大于480
+                scale = 480 / frame.shape[0]
+                frame = cv2.resize(frame, None, fx=scale, fy=scale, 
+                                 interpolation=cv2.INTER_AREA)
+            
             # 进行物体检测
-            frame = object_detector.detect_objects(frame)
+            if headless:
+                results = object_detector.model(frame, conf=object_detector.conf_threshold)
+                for result in results:
+                    boxes = result.boxes
+                    for box in boxes:
+                        conf = float(box.conf[0])
+                        cls = int(box.cls[0])
+                        if cls == object_detector.traffic_light_class and conf > 0.7:
+                            x1, y1, x2, y2 = box.xyxy[0]
+                            center_x = int((x1 + x2) / 2)
+                            center_y = int((y1 + y2) / 2)
+                            object_id = f"traffic_light_{center_x}_{center_y}"
+                            # 简化颜色检测逻辑
+                            light_roi = frame[int(y1):int(y2), int(x1):int(x2)]
+                            if light_roi.size > 0:
+                                hsv_roi = cv2.cvtColor(light_roi, cv2.COLOR_BGR2HSV)
+                                red_mask = cv2.inRange(hsv_roi, np.array([0, 100, 100]), 
+                                                     np.array([10, 255, 255]))
+                                green_mask = cv2.inRange(hsv_roi, np.array([35, 100, 100]), 
+                                                       np.array([85, 255, 255]))
+                                if cv2.countNonZero(red_mask) > cv2.countNonZero(green_mask):
+                                    object_detector.tts_manager.speak("红灯", object_id)
+                                else:
+                                    object_detector.tts_manager.speak("绿灯", object_id)
+            else:
+                frame = object_detector.detect_objects(frame)
+                # 简化显示的统计信息
+                cv2.putText(frame, f'FPS: {fps:.1f}', (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                try:
+                    cv2.imshow('Camera Stream', frame)
+                except cv2.error as e:
+                    print(f"显示帧失败: {e}")
+                    continue
             
-            # 添加统计信息到画面
-            cv2.putText(frame, f'FPS: {fps:.1f}', (10, 30),
-                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f'Frame Interval: {frame_interval*1000:.1f}ms', (10, 70),
-                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f'Queue Size: {assembler.display_queue.qsize()}', (10, 110),
-                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            try:
-                cv2.imshow('Camera Stream', frame)
-            except cv2.error as e:
-                print(f"显示帧失败: {e}")
-                continue
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('s'):  # 添加截图功能
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                cv2.imwrite(f'capture_{timestamp}.jpg', frame)
-                print(f"截图已保存: capture_{timestamp}.jpg")
+            if not headless:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('s'):
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    cv2.imwrite(f'capture_{timestamp}.jpg', frame)
+                    print(f"截图已保存: capture_{timestamp}.jpg")
         except Empty:
             continue
         except Exception as e:
-            print(f"显示错误: {e}")
-            time.sleep(0.1)  # 出错时短暂暂停
+            print(f"处理错误: {e}")
+            time.sleep(0.1)
             continue
 
-    try:
-        cv2.destroyAllWindows()
-    except:
-        pass
+    if not headless:
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
 
 def main():
+    # 添加命令行参数
+    parser = argparse.ArgumentParser(description='ESP32摄像头客户端')
+    parser.add_argument('--headless', action='store_true', help='无显示模式，只进行物体检测和语音播报')
+    args = parser.parse_args()
+    
     assembler = FrameAssembler()
     
     # 创建接收线程
@@ -340,15 +443,15 @@ def main():
     
     # 在主线程中运行显示
     try:
-        display_stream(assembler)
+        display_stream(assembler, args.headless)
     except KeyboardInterrupt:
         print("\n正在退出...")
     finally:
-        # 清理资源
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
+        if not args.headless:
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass
 
 if __name__ == "__main__":
     main() 
